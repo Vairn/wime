@@ -1,0 +1,18 @@
+# Dependencies / build
+**/node_modules/
+**/dist/
+*.local
+
+# Python
+__pycache__/
+*.pyc
+
+# Large / derived assets (keep out of initial TS player commit)
+*.adf
+wav/
+combined/
+disk1/
+disk2/
+_ref/
+_dist/
+*.zip
