@@ -1,5 +1,28 @@
+/**
+ * Sonix instrument loader for War in Middle-earth (WiME) music playback.
+ *
+ * Sonix is the proprietary sound engine used by the game. Instruments arrive in several
+ * binary formats that this module decodes into a unified {@link Instrument} structure:
+ *
+ * - **Synthesis** (502 bytes): A 128-byte source waveform is expanded by the OneFilter
+ *   algorithm into 64 band-limited filter banks. Playback selects a bank from filter
+ *   parameters (fBase, fEnv) and can apply modulation tables, LFO, and ADSR envelopes.
+ *
+ * - **SampledSound** (128-byte header): A stub that names an external `.ss` sample file.
+ *   The `.ss` payload stores one-shot length, repeat length, and octave range; sample
+ *   data is packed so higher octaves subsample lower-octave bytes (powers of two).
+ *
+ * - **8SVX** (Amiga IFF): Classic one-shot/repeat sample with sample rate in VHDR.
+ *
+ * - **`.ss` files** can also be loaded directly as raw sample instruments.
+ *
+ * Field offsets in Synthesis/SampledSound bodies mirror the original Sonix instrument
+ * layout (volume at 0x1ac, ADSR levels at 0x1c6, etc.).
+ */
+
 import { i8ToF32, iterIffChunks, readCString, readU16BE, toI16, toI32 } from "./iff";
 
+/** Precomputed OneFilter coefficient table (64 steps); mirrors the original Sonix ROM table. */
 const FILTER_COEFFS = [
   0x8000, 0x7683, 0x6dba, 0x6597, 0x5e10, 0x5717, 0x50a2, 0x4aa8, 0x451f, 0x4000, 0x3b41,
   0x36dd, 0x32cb, 0x2f08, 0x2b8b, 0x2851, 0x2554, 0x228f, 0x2000, 0x1da0, 0x1b6e, 0x1965,
@@ -9,8 +32,14 @@ const FILTER_COEFFS = [
   0x01da, 0x01b6, 0x0196, 0x0178, 0x015c, 0x0142, 0x012a, 0x0114, 0x0100,
 ];
 
+/** Discriminator for which Sonix loader produced the instrument. */
 export type InstrumentKind = "synth" | "sample" | "8svx";
 
+/**
+ * Runtime instrument state shared by the SMUS player voices.
+ * Holds waveform data (or filter banks for synth), loop points, pitch base,
+ * envelope/modulation parameters, and optional multi-octave `.ss` backing data.
+ */
 export interface Instrument {
   name: string;
   kind: InstrumentKind;
@@ -45,6 +74,14 @@ export interface Instrument {
   vibDelay: number;
 }
 
+/**
+ * Allocate an {@link Instrument} with Sonix-typical defaults for the given kind.
+ * Synth defaults include a 128-sample wave, standard ADSR levels/rates, and LFO off.
+ *
+ * @param name - Display / lookup name for the instrument.
+ * @param kind - Loader category (`synth`, `sample`, or `8svx`).
+ * @returns A fresh instrument object; callers overwrite fields as needed.
+ */
 function emptyInstrument(name: string, kind: InstrumentKind): Instrument {
   return {
     name,
@@ -81,30 +118,49 @@ function emptyInstrument(name: string, kind: InstrumentKind): Instrument {
   };
 }
 
+/**
+ * Sonix OneFilter: expand a 128-byte unsigned waveform into 64 × 128 signed output samples.
+ *
+ * Each of the 64 steps applies a low-pass / interpolation kernel (coefficients in
+ * {@link FILTER_COEFFS}) so synthesis voices can pick a brightness band without
+ * aliasing when transposing. This is a direct port of the original 68000 routine.
+ *
+ * @param wave128 - Raw 128-byte waveform from a Synthesis instrument (bytes 68–195).
+ * @returns 8192 signed bytes: bank `b` occupies `[b*128 .. b*128+127]`.
+ */
 export function sonixOneFilter(wave128: Uint8Array): Int8Array {
   const wave = new Int8Array(128);
+  // Unsigned 0..255 → signed −128..127 for filter arithmetic.
   for (let i = 0; i < 128; i++) {
     let b = wave128[i]!;
     wave[i] = b >= 128 ? b - 256 : b;
   }
+
   const out = new Int8Array(64 * 128);
-  let d3 = 0;
-  let d4 = toI16(wave[127]! << 7);
+  let d3 = 0; // integrator state (16-bit signed)
+  let d4 = toI16(wave[127]! << 7); // delay / feedback from last source sample
   let oi = 0;
+
   for (let step = 0; step < 64; step++) {
+    // d1 = low-pass coefficient; d2 = complementary high-pass scale for this step.
     let d1 = FILTER_COEFFS[step]!;
     let d2 = (0x8000 - d1) & 0xffff;
-    d2 = ((d2 * 0xe666) >>> 0) >>> 16;
+    d2 = ((d2 * 0xe666) >>> 0) >>> 16; // fixed-point rescale (≈ ×0.9)
     d1 >>= 1;
+
     for (let s = 0; s < 128; s++) {
-      const d6 = toI16(toI16(wave[s]! << 7) - d4);
+      const d6 = toI16(toI16(wave[s]! << 7) - d4); // input delta vs. delayed output
       let prod = toI32(toI16(d1) * d6);
       prod = toI32(prod << 2);
-      d3 = toI16(d3 + (prod >> 16));
-      d4 = toI16(d4 + d3);
+      d3 = toI16(d3 + (prod >> 16)); // accumulate filtered component
+      d4 = toI16(d4 + d3); // pole update
+
+      // Rotate d4 right by 7 (Amiga-style) and emit one output byte.
       const d4u = d4 & 0xffff;
       const ror = ((d4u >> 7) | ((d4u & 0x7f) << 9)) & 0xffff;
       out[oi++] = ror & 0xff;
+
+      // Leak integrator d3 toward zero using the high-pass coefficient d2.
       const prod3 = toI32(toI16(d3) * toI16(d2));
       d3 = toI16(toI32(prod3 << 1) >> 16);
     }
@@ -112,6 +168,15 @@ export function sonixOneFilter(wave128: Uint8Array): Int8Array {
   return out;
 }
 
+/**
+ * Decode Sonix rate units (16-bit encoded value) to a playback sample rate in Hz.
+ *
+ * Layout: 3-bit exponent XOR 7 in bits 5–7, 5-bit mantissa in bits 0–4 (plus bias 0x21).
+ * Zero input maps to 4000 Hz as a safe default.
+ *
+ * @param r - Raw rate word from instrument or voice data.
+ * @returns Sample rate in Hz.
+ */
 export function sonixRateUnits(r: number): number {
   r &= 0xffff;
   if (r === 0) return 4000;
@@ -120,18 +185,40 @@ export function sonixRateUnits(r: number): number {
   return mant << exp;
 }
 
+/**
+ * Choose which octave slice of a multi-octave `.ss` sample to use for a MIDI note.
+ *
+ * Sonix stores octave index as `10 - floor(midi/12)` (middle C ≈ octave 5 → index 5),
+ * clamped to the instrument's lo/hi octave range.
+ *
+ * @param midi - MIDI note number (0–127).
+ * @param lo - Lowest stored octave index in the `.ss` file.
+ * @param hi - Highest stored octave index in the `.ss` file.
+ * @returns Octave index to index into the packed sample layout.
+ */
 export function sampleOctaveForMidi(midi: number, lo: number, hi: number): number {
   const octv = 10 - Math.floor(midi / 12);
   return Math.max(lo, Math.min(hi, octv));
 }
 
+/**
+ * Load an Amiga IFF `FORM 8SVX` one-shot sample into an {@link Instrument}.
+ *
+ * Reads VHDR for oneshot/repeat sample counts and rate; BODY holds 8-bit sample bytes.
+ *
+ * @param data - Full IFF file bytes.
+ * @param name - Instrument name for error messages and display.
+ * @returns A sample-kind instrument with loop points derived from VHDR.
+ */
 function load8svx(data: Uint8Array, name: string): Instrument {
   let oneshot = 0;
   let repeat = 0;
   let rate = 8363;
   let body = new Uint8Array(0);
+
   for (const { cid, body: chunk } of iterIffChunks(data)) {
     if (cid === "VHDR" && chunk.length >= 14) {
+      // VHDR: oneShot (u32), repeat (u32), samples per high/low cycle, then rate at +12.
       oneshot = (chunk[0]! << 24) | (chunk[1]! << 16) | (chunk[2]! << 8) | chunk[3]!;
       oneshot >>>= 0;
       repeat =
@@ -141,6 +228,7 @@ function load8svx(data: Uint8Array, name: string): Instrument {
       body = new Uint8Array(chunk);
     }
   }
+
   const wave = i8ToF32(body);
   const inst = emptyInstrument(name, "8svx");
   inst.wave = wave;
@@ -150,6 +238,28 @@ function load8svx(data: Uint8Array, name: string): Instrument {
   return inst;
 }
 
+/**
+ * Load a raw Sonix `.ss` sample file (multi-octave packed 8-bit audio).
+ *
+ * Header layout (first 64 bytes):
+ * - +0 u16 oneshot length (samples at base octave)
+ * - +2 u16 repeat length
+ * - +4 u8 lo octave, +5 u8 hi octave
+ * - +0x3e start of interleaved octave payload
+ *
+ * Higher octaves are stored by subsampling: octave `n` uses every 2^(n-lo) byte from
+ * the cumulative buffer, so offset = oneshot × ((2^mid − 2^lo)) and length = oneshot × 2^mid.
+ *
+ * @param data - Full `.ss` file bytes.
+ * @param name - Instrument name.
+ * @param volume - Playback volume scalar (default 1).
+ * @param envLevels - ADSR level bytes [A, D, S, R].
+ * @param envRates - ADSR rate words [A, D, S, R].
+ * @param vibDepth - Vibrato depth (0–255).
+ * @param vibRate - Vibrato rate.
+ * @param vibDelay - Vibrato delay.
+ * @returns A sample-kind instrument; retains full `ssData` for runtime octave switching.
+ */
 export function loadSs(
   data: Uint8Array,
   name: string,
@@ -161,19 +271,26 @@ export function loadSs(
   vibDelay = 0,
 ): Instrument {
   if (data.length < 64) throw new Error(`Truncated .ss: ${name}`);
+
   const oneshot = readU16BE(data, 0);
   const repeat = readU16BE(data, 2);
   let loOct = data[4]!;
   let hiOct = data[5]!;
   if (hiOct < loOct) hiOct = loOct;
+
   const payload = i8ToF32(data.subarray(0x3e));
-  const mid = sampleOctaveForMidi(60, loOct, hiOct);
+  const mid = sampleOctaveForMidi(60, loOct, hiOct); // default preview at middle C
+
+  // Multi-octave layout: skip lower-octave bytes, then take `oneshot << mid` samples.
   const off = oneshot * ((1 << mid) - (1 << loOct));
   const ln = oneshot << mid;
   let wave = payload.subarray(off, off + ln);
+
+  // Fallback if computed slice is empty (truncated or edge-case header).
   if (wave.length === 0) {
     wave = payload.subarray(0, Math.max(1, Math.min(payload.length, oneshot << loOct)));
   }
+
   const inst = emptyInstrument(name, "sample");
   inst.wave = wave.length ? new Float32Array(wave) : new Float32Array(1);
   inst.volume = volume;
@@ -190,13 +307,33 @@ export function loadSs(
   return inst;
 }
 
+/**
+ * Read a big-endian u16 from an instrument body at `off`, or 0 if out of range.
+ *
+ * @param body - Instrument data starting at file offset 32 (after 32-byte header).
+ * @param off - Byte offset within `body`.
+ */
 function bodyU16(body: Uint8Array, off: number): number {
   if (off + 2 > body.length) return 0;
   return readU16BE(body, off);
 }
 
+/**
+ * Load a Sonix **Synthesis** instrument (502 bytes).
+ *
+ * Structure:
+ * - Bytes 68–195: 128-byte source wave → {@link sonixOneFilter} → 64 filter banks.
+ * - Body (from +32): mod table at 0xa4, volume/ADSR/filter/LFO fields at documented offsets.
+ *
+ * Initial playback wave is filter bank 0 selected from fBase and fEnv.
+ *
+ * @param data - Full 502-byte `.instr` or embedded synthesis blob.
+ * @param name - Instrument name.
+ * @returns A synth-kind instrument with `filterBanks` and modulation tables populated.
+ */
 export function loadSynthInstr(data: Uint8Array, name: string): Instrument {
   if (data.length < 68 + 128) throw new Error("Truncated Synthesis instrument");
+
   const waveRaw = data.subarray(68, 196);
   const banksI8 = sonixOneFilter(waveRaw);
   const banks: Float32Array[] = [];
@@ -204,7 +341,7 @@ export function loadSynthInstr(data: Uint8Array, name: string): Instrument {
     const row = new Float32Array(128);
     for (let s = 0; s < 128; s++) {
       let v = banksI8[b * 128 + s]!;
-      row[s] = v / 128;
+      row[s] = v / 128; // normalize signed byte to ≈ −1..1
     }
     banks.push(row);
   }
@@ -218,17 +355,21 @@ export function loadSynthInstr(data: Uint8Array, name: string): Instrument {
     modTable[i] = v / 128;
   }
 
+  // Volume block (offsets relative to body = file offset 32).
   const volRaw = bodyU16(body, 0x1ac) & 0xff;
   const vol = 0.35 + 0.65 * (Math.max(volRaw, 1) / 255);
   const volEnv = bodyU16(body, 0x1ae) !== 0;
   const volMod = bodyU16(body, 0x1b0) & 0xff;
   const pitchMod = bodyU16(body, 0x1b4) & 0xff;
+
+  // ADSR levels: attack, decay, sustain, release (each byte at even offsets from 0x1c6).
   const levels: [number, number, number, number] = [
     bodyU16(body, 0x1c6) & 0xff,
     bodyU16(body, 0x1c8) & 0xff,
     bodyU16(body, 0x1ca) & 0xff,
     bodyU16(body, 0x1cc) & 0xff,
   ];
+  // ADSR rates: full 16-bit words at 0x1ce..0x1d4.
   const rates: [number, number, number, number] = [
     bodyU16(body, 0x1ce),
     bodyU16(body, 0x1d0),
@@ -236,6 +377,7 @@ export function loadSynthInstr(data: Uint8Array, name: string): Instrument {
     bodyU16(body, 0x1d4),
   ];
 
+  // Filter / LFO parameters.
   const fBase = bodyU16(body, 0x1b6) & 0xff;
   const fEnv = bodyU16(body, 0x1b8) & 0xff;
   const fMod = bodyU16(body, 0x1ba) & 0xff;
@@ -246,6 +388,7 @@ export function loadSynthInstr(data: Uint8Array, name: string): Instrument {
   const lfoEnable = lfoWord !== 0;
   const lfoOneshot = lfoSigned >= 0;
 
+  // Pick initial filter bank: brighter when fBase is low and fEnv is high.
   const bank0 = Math.max(
     0,
     Math.min(63, ((255 - fBase) - ((255 * fEnv) >> 8)) >> 2),
@@ -275,16 +418,42 @@ export function loadSynthInstr(data: Uint8Array, name: string): Instrument {
   return inst;
 }
 
+/**
+ * Fetch raw bytes from a URL (used when loading instruments from a folder on disk or HTTP).
+ *
+ * @param url - Absolute or relative URL to the file.
+ * @throws If the HTTP response is not OK.
+ */
 async function fetchBytes(url: string): Promise<Uint8Array> {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
   return new Uint8Array(await res.arrayBuffer());
 }
 
+/**
+ * Decode a fixed-length null-terminated ASCII string from a byte array.
+ *
+ * @param data - Source bytes.
+ * @param start - Start offset of the string.
+ * @param len - Maximum length to read (including possible NUL terminator).
+ */
 function decodeAscii(data: Uint8Array, start: number, len: number): string {
   return readCString(data.subarray(start, start + len));
 }
 
+/**
+ * Load a **SampledSound** instrument: 128-byte header that references an external `.ss` file.
+ *
+ * The header at +68 holds a 24-char `.ss` basename. Envelope and vibrato fields live in the
+ * body at offsets 0x48–0x5e (volume, ADSR, vib depth/rate/delay). Fetches the `.ss` via
+ * `fetchFile`, trying `.ss` and `.SS` extensions.
+ *
+ * @param data - Full 128-byte SampledSound header (or longer with body).
+ * @param name - Logical instrument name.
+ * @param folderUrl - Base URL for samples (reserved for caller-side catalog probing).
+ * @param fetchFile - Async loader for sibling `.ss` files by filename.
+ * @returns A sample-kind instrument built by {@link loadSs}.
+ */
 export async function loadSampledInstr(
   data: Uint8Array,
   name: string,
@@ -293,7 +462,10 @@ export async function loadSampledInstr(
 ): Promise<Instrument> {
   const ssName = decodeAscii(data, 68, 24);
   if (!ssName) throw new Error(`No .ss name in ${name}`);
+
   const body = data.length >= 32 ? data.subarray(32) : data;
+
+  // SampledSound ADSR / volume block (body offsets 0x48..0x5e).
   const volWord = bodyU16(body, 0x48) || 0xc0;
   const volume = Math.max(volWord, 1) / 255;
   const levels: [number, number, number, number] = [
@@ -327,6 +499,12 @@ export async function loadSampledInstr(
   throw lastErr ?? new Error(`Missing sample '${ssName}.ss' for ${name}`);
 }
 
+/**
+ * Build a built-in default synth instrument (sine + 2nd harmonic) for fallback playback.
+ *
+ * @param name - Instrument name (default `"default"`).
+ * @returns A simple synth-kind instrument with a 128-sample looping wave.
+ */
 export function defaultInstrument(name = "default"): Instrument {
   const wave = new Float32Array(128);
   for (let i = 0; i < 128; i++) {
@@ -340,6 +518,20 @@ export function defaultInstrument(name = "default"): Instrument {
   return inst;
 }
 
+/**
+ * Inspect raw bytes and dispatch to the appropriate Sonix loader.
+ *
+ * Detection order:
+ * - `FORM` + `8SVX` → {@link load8svx}
+ * - `FORM` + `AIFF` → unsupported error
+ * - 128 bytes + `SampledSound` magic → return `"sampled"` (caller fetches `.ss`)
+ * - 502 bytes + `Synthesis` magic (or leading zeros) → {@link loadSynthInstr}
+ * - 502 / 128 bytes with weaker heuristics → synth or sampled respectively
+ *
+ * @param data - Raw instrument file contents.
+ * @param name - Filename or logical name for errors.
+ * @returns Loaded instrument, or `"sampled"` if a SampledSound stub needs async `.ss` load.
+ */
 export function detectAndLoadInstrument(
   data: Uint8Array,
   name: string,
@@ -362,6 +554,20 @@ export function detectAndLoadInstrument(
   throw new Error(`Unknown instrument format: ${name} (${data.length} bytes)`);
 }
 
+/**
+ * Load a named instrument from a folder using a case-insensitive file index.
+ *
+ * Resolution steps:
+ * 1. Look up `name.instr` in `fileIndex` (keys are lowercased paths).
+ * 2. If missing, match any index key whose stem equals `name` (bare filename).
+ * 3. Fetch bytes, {@link detectAndLoadInstrument}; if `"sampled"`, resolve `.ss` via index
+ *    (exact key, then stem match among `*.ss` entries).
+ *
+ * @param folderUrl - Base URL/path prefix for instrument files.
+ * @param name - Instrument stem (without `.instr`).
+ * @param fileIndex - Map of lowercased filename → actual filename on disk (for case folding).
+ * @returns Fully loaded {@link Instrument}.
+ */
 export async function loadInstrumentByName(
   folderUrl: string,
   name: string,
@@ -376,7 +582,7 @@ export async function loadInstrumentByName(
   const instrKey = `${name}.instr`.toLowerCase();
   let instrFile = fileIndex.get(instrKey);
   if (!instrFile) {
-    // bare name
+    // bare name: match index entry whose stem equals `name`
     for (const [k, v] of fileIndex) {
       if (k.replace(/\.[^.]+$/, "") === name.toLowerCase()) {
         instrFile = v;
@@ -393,7 +599,7 @@ export async function loadInstrumentByName(
       const key = ssName.toLowerCase();
       const mapped = fileIndex.get(key);
       if (!mapped) {
-        // try stem match
+        // try stem match: e.g. `foo.ss` when index key is `Foo.SS`
         const stem = ssName.replace(/\.ss$/i, "").toLowerCase();
         for (const [k, v] of fileIndex) {
           if (k.endsWith(".ss") && k.replace(/\.ss$/, "") === stem) return fetchFile(v);

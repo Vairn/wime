@@ -1,13 +1,28 @@
+/**
+ * War in Middle-earth — IFF-SMUS Tracker UI bootstrap.
+ *
+ * This module is the application shell: it injects the tracker layout into `#app`,
+ * wires DOM controls (song picker, transport, export), builds the per-channel
+ * pattern grid and beat rail, and drives live updates from the audio engine
+ * (scopes, VU meters, score canvas, playhead scroll).
+ *
+ * Playback and offline WAV export are delegated to `AudioPlayer`; pattern parsing
+ * and score rendering use `smus` and `ScoreView` respectively.
+ */
+
 import "./style.css";
 import type { SmusEngine } from "./engine";
 import { midiToName, expandPattern, type PatternRow, type SmusScore } from "./smus";
 import { AudioPlayer, buildFileIndex, loadSong, exportSongWav, downloadBlob } from "./player";
 import { ScoreView } from "./score";
 
+/** Pixel height of one tracker row; used for playhead scroll math. */
 const ROW_H = 22;
 
+/** Root mount point for the entire tracker UI. */
 const app = document.querySelector<HTMLDivElement>("#app")!;
 
+// --- Static layout: header transport, scopes, score panel, tracker grid, footer ---
 app.innerHTML = `
   <header class="topbar">
     <div class="brand">
@@ -50,6 +65,7 @@ app.innerHTML = `
   </footer>
 `;
 
+// --- DOM references: transport controls, metadata readouts, tracker regions ---
 const songSelect = app.querySelector<HTMLSelectElement>("#song")!;
 const playBtn = app.querySelector<HTMLButtonElement>("#play")!;
 const stopBtn = app.querySelector<HTMLButtonElement>("#stop")!;
@@ -65,12 +81,14 @@ const beatRowsEl = app.querySelector<HTMLElement>("#beatRows")!;
 const scoreCanvas = app.querySelector<HTMLCanvasElement>("#score")!;
 const scoreView = new ScoreView(scoreCanvas);
 
+// Per-channel DOM handles populated in the loop below (scopes + pattern columns).
 const scopeCanvases: HTMLCanvasElement[] = [];
 const noteEls: HTMLElement[] = [];
 const instEls: HTMLElement[] = [];
 const vuEls: HTMLElement[] = [];
 const rowContainers: HTMLElement[] = [];
 
+// Build four channel scope cards (waveform + VU) and matching pattern columns.
 for (let ch = 0; ch < 4; ch++) {
   const card = document.createElement("div");
   card.className = "scope-card";
@@ -101,20 +119,40 @@ for (let ch = 0; ch < 4; ch++) {
 const player = new AudioPlayer();
 let fileIndex: Map<string, string> = new Map();
 let songs: string[] = [];
+/** Expanded pattern rows per Paula channel (0–3), rebuilt when a song loads. */
 let patternByChannel: PatternRow[][] = [[], [], [], []];
+/** Total pattern length in beats (max beat + duration across all rows). */
 let maxBeat = 0;
 let currentScore: SmusScore | null = null;
 let loadedInstruments: Map<number, import("./instruments").Instrument> | null = null;
+/** Guards against overlapping async song loads. */
 let loading = false;
 
+/**
+ * Format a byte-sized number as two uppercase hex digits (e.g. instrument/volume cells).
+ *
+ * @param n - Integer in 0–255 range (caller responsibility).
+ * @returns Two-character hex string, zero-padded.
+ */
 function hex2(n: number): string {
   return n.toString(16).toUpperCase().padStart(2, "0");
 }
 
+/**
+ * Rebuild the tracker pattern grid and beat rail from a loaded SMUS score.
+ *
+ * Expands the score into timed rows, quantizes unique beat positions into a
+ * shared vertical grid, renders note/rest/empty cells per channel, updates the
+ * beat rail labels, and refreshes the score canvas data.
+ *
+ * @param score - Parsed SMUS score for the currently selected song.
+ */
 function buildPatternDom(score: SmusScore): void {
   const rows = expandPattern(score);
   patternByChannel = [[], [], [], []];
   maxBeat = 0;
+
+  // Partition note/rest rows by channel; skip control/meta rows.
   for (const r of rows) {
     if (r.kind === "ctrl") continue;
     patternByChannel[r.channel]?.push(r);
@@ -129,6 +167,7 @@ function buildPatternDom(score: SmusScore): void {
   const beatList = [...beats].sort((a, b) => a - b);
   if (beatList.length === 0) beatList.push(0);
 
+  // One DOM row per quantized beat, per channel column.
   for (let ch = 0; ch < 4; ch++) {
     const container = rowContainers[ch]!;
     container.innerHTML = "";
@@ -144,8 +183,10 @@ function buildPatternDom(score: SmusScore): void {
       const el = document.createElement("div");
       el.className = "row";
       el.dataset.beat = String(b);
+      // Whole-number beats divisible by 4 get a bar-line style.
       if (Math.round(b) === b && b % 4 === 0) el.classList.add("bar");
       if (!r) {
+        // No event at this beat — dim placeholder cell.
         el.innerHTML = `<span class="cell-note">···</span>`;
         el.style.opacity = "0.35";
       } else if (r.kind === "rest") {
@@ -161,6 +202,7 @@ function buildPatternDom(score: SmusScore): void {
     }
   }
 
+  // Beat rail: left column labels aligned with pattern rows.
   beatRowsEl.innerHTML = "";
   for (let i = 0; i < beatList.length; i++) {
     const b = beatList[i]!;
@@ -177,10 +219,20 @@ function buildPatternDom(score: SmusScore): void {
   scoreView.setScore(rows, maxBeat);
 }
 
+/**
+ * Vertically scroll the beat rail and pattern columns so `beat` sits at the playhead.
+ *
+ * Finds the bracketing rows in the quantized beat list, interpolates fractional
+ * position between them, applies a shared `translateY` to rail + channels, and
+ * toggles the `active` class on the current row in each channel.
+ *
+ * @param beat - Current playback position in beats (from engine).
+ */
 function scrollToBeat(beat: number): void {
   const beats = (beatRowsEl as HTMLElement & { _beats?: number[] })._beats ?? [];
   if (!beats.length) return;
 
+  // Index of the last beat row at or before the current position.
   let idx = 0;
   for (let i = 0; i < beats.length; i++) {
     if (beats[i]! <= beat + 1e-6) idx = i;
@@ -194,6 +246,7 @@ function scrollToBeat(beat: number): void {
     frac = b > a ? Math.min(1, Math.max(0, (beat - a) / (b - a))) : 0;
   }
 
+  // Center the interpolated row on the fixed playhead in the tracker viewport.
   const center = (scopesEl.parentElement?.querySelector(".tracker") as HTMLElement)?.clientHeight ?? 400;
   const mid = center / 2 - ROW_H / 2 - 28;
   const y = mid - (idx + frac) * ROW_H;
@@ -210,6 +263,16 @@ function scrollToBeat(beat: number): void {
   }
 }
 
+/**
+ * Draw the mini waveform scope for one Paula channel.
+ *
+ * When the voice is active, samples the instrument wave table from the current
+ * phase position and scales amplitude by the envelope; otherwise draws a flat line.
+ * Always overlays a faint horizontal center grid.
+ *
+ * @param ch - Channel index 0–3.
+ * @param eng - Live engine state, or `null` when idle (flat scope).
+ */
 function drawScope(ch: number, eng: SmusEngine | null): void {
   const canvas = scopeCanvases[ch]!;
   const ctx = canvas.getContext("2d")!;
@@ -252,6 +315,14 @@ function drawScope(ch: number, eng: SmusEngine | null): void {
   ctx.stroke();
 }
 
+/**
+ * Per-frame UI refresh callback wired to `AudioPlayer.onFrame`.
+ *
+ * Updates BPM/position readouts, scrolls the tracker playhead, advances the score
+ * view, and refreshes each channel's note label, instrument name, VU meter, and scope.
+ *
+ * @param eng - Current `SmusEngine` snapshot for this audio frame.
+ */
 function updateUi(eng: SmusEngine): void {
   bpmEl.textContent = eng.bpm.toFixed(1);
   posEl.textContent = eng.beatPos.toFixed(2);
@@ -267,6 +338,7 @@ function updateUi(eng: SmusEngine): void {
       vuEls[ch]!.style.width = `${pct}%`;
     } else {
       noteEls[ch]!.textContent = "---";
+      // Decay VU bar smoothly when voice is silent.
       const p = parseFloat(vuEls[ch]!.style.width || "0") * 0.88;
       vuEls[ch]!.style.width = `${p}%`;
     }
@@ -274,6 +346,14 @@ function updateUi(eng: SmusEngine): void {
   }
 }
 
+/**
+ * Load a song by catalog stem: fetch SMUS + instruments, rebuild pattern DOM, reset UI.
+ *
+ * Stops playback, disables transport while loading, and re-enables play/export on success.
+ * On failure, surfaces the error in the status line.
+ *
+ * @param stem - Song filename stem from `catalog.json` (select option value).
+ */
 async function selectSong(stem: string): Promise<void> {
   if (loading) return;
   loading = true;
@@ -305,6 +385,7 @@ async function selectSong(stem: string): Promise<void> {
   }
 }
 
+// --- Play: start engine, enable per-frame UI updates, toggle transport state ---
 playBtn.addEventListener("click", async () => {
   if (!currentScore || !loadedInstruments) return;
   statusEl.textContent = `Playing ${currentScore.name}`;
@@ -317,6 +398,7 @@ playBtn.addEventListener("click", async () => {
   if (player.engine) scrollToBeat(0);
 });
 
+// --- Stop: halt playback and reset visual state to idle ---
 stopBtn.addEventListener("click", () => {
   player.stop();
   pulseEl.classList.remove("on");
@@ -333,10 +415,12 @@ stopBtn.addEventListener("click", () => {
   }
 });
 
+// --- Song picker: load newly selected stem into the tracker ---
 songSelect.addEventListener("change", () => {
   void selectSong(songSelect.value);
 });
 
+// --- Export WAV: offline render via worker, download blob, restore UI ---
 exportBtn.addEventListener("click", async () => {
   if (!currentScore || !loadedInstruments || loading) return;
   const wasPlaying = player.playing;
@@ -370,6 +454,7 @@ exportBtn.addEventListener("click", async () => {
   }
 });
 
+// Default frame hook (overwritten again on play); handles natural song end.
 player.onFrame = updateUi;
 player.onEnded = () => {
   pulseEl.classList.remove("on");
@@ -378,6 +463,11 @@ player.onEnded = () => {
   statusEl.textContent = "Finished";
 };
 
+/**
+ * Application entry: fetch song catalog, build asset file index, populate picker, load initial song.
+ *
+ * Prefers `Hob.Riven` when present; otherwise selects the first catalog entry.
+ */
 async function boot(): Promise<void> {
   statusEl.textContent = "Loading catalog…";
   const catalog = await fetch("/catalog.json").then((r) => r.json());

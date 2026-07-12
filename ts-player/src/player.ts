@@ -1,14 +1,25 @@
+/**
+ * Song loading + realtime / offline playback glue for the browser.
+ *
+ * Loads SMUS + instruments over HTTP, drives SmusEngine through a
+ * ScriptProcessorNode for live audio, and can offline-render to WAV.
+ */
 import { SmusEngine } from "./engine";
 import { defaultInstrument, loadInstrumentByName, type Instrument } from "./instruments";
 import { parseSmus, type SmusScore } from "./smus";
 import { downloadBlob, encodeWav } from "./wav";
 
+/** A score plus its resolved instrument bank and the catalog file index. */
 export interface LoadedSong {
   score: SmusScore;
   instruments: Map<number, Instrument>;
   fileIndex: Map<string, string>;
 }
 
+/**
+ * Fetch catalog.json and build a lowercase → real-filename map.
+ * Amiga disks mix case; the index lets lookups ignore casing.
+ */
 export async function buildFileIndex(catalogUrl = "/catalog.json"): Promise<Map<string, string>> {
   const res = await fetch(catalogUrl);
   const catalog = (await res.json()) as { files: string[] };
@@ -19,6 +30,14 @@ export async function buildFileIndex(catalogUrl = "/catalog.json"): Promise<Map<
   return map;
 }
 
+/**
+ * Load a SMUS song by stem (e.g. "Hob.Riven") and all of its instruments.
+ *
+ * 1. Resolve the .smus filename via the catalog
+ * 2. Parse the score
+ * 3. Load each INS1 instrument (falling back to a sine default on failure)
+ * 4. Ensure register 0 always exists
+ */
 export async function loadSong(
   songStem: string,
   fileIndex: Map<string, string>,
@@ -30,6 +49,7 @@ export async function loadSong(
   const data = new Uint8Array(await res.arrayBuffer());
   const score = parseSmus(data, smusName);
 
+  // Load every instrument register referenced by the score.
   const instruments = new Map<number, Instrument>();
   for (const [reg, name] of score.instruments) {
     try {
@@ -39,6 +59,7 @@ export async function loadSong(
       instruments.set(reg, defaultInstrument(name));
     }
   }
+  // Register 0 is the fallback voice when a track hasn't selected an instrument yet.
   if (!instruments.has(0)) {
     instruments.set(0, defaultInstrument());
   }
@@ -46,16 +67,27 @@ export async function loadSong(
   return { score, instruments, fileIndex };
 }
 
+/**
+ * Realtime player: owns an AudioContext, ScriptProcessorNode, and SmusEngine.
+ * Pulls audio blocks from the engine on the audio thread callback and
+ * notifies the UI via `onFrame` each animation frame.
+ */
 export class AudioPlayer {
   ctx: AudioContext | null = null;
   engine: SmusEngine | null = null;
   private node: ScriptProcessorNode | null = null;
   private gain: GainNode | null = null;
   playing = false;
+  /** Called every animation frame while playing (drives scopes / playhead). */
   onFrame: ((engine: SmusEngine) => void) | null = null;
+  /** Called once when the song finishes naturally. */
   onEnded: (() => void) | null = null;
   private raf = 0;
 
+  /**
+   * Lazily create (or resume) the AudioContext.
+   * Browsers require a user gesture before audio can start — Play click covers that.
+   */
   async ensureCtx(): Promise<AudioContext> {
     if (!this.ctx) {
       this.ctx = new AudioContext({ sampleRate: 44100 });
@@ -64,13 +96,18 @@ export class AudioPlayer {
     return this.ctx;
   }
 
+  /**
+   * Start playing a score from the beginning.
+   * Stops any current playback, builds a fresh engine, and wires ScriptProcessor → speakers.
+   */
   async play(score: SmusScore, instruments: Map<number, Instrument>, volume = 0.28): Promise<void> {
     this.stop(false);
     const ctx = await this.ensureCtx();
     this.engine = new SmusEngine(score, instruments, ctx.sampleRate, volume);
-    this.engine.kick();
+    this.engine.kick(); // consume leading control events before first audio block
 
     const bufferSize = 2048;
+    // ScriptProcessor pulls `bufferSize` frames whenever the audio graph needs data.
     const node = ctx.createScriptProcessor(bufferSize, 0, 2);
     const gain = ctx.createGain();
     gain.gain.value = 1;
@@ -80,12 +117,14 @@ export class AudioPlayer {
     const interleaved = new Float32Array(bufferSize * 2);
     node.onaudioprocess = (ev) => {
       const eng = this.engine;
+      // Song over → output silence and tear down.
       if (!eng || eng.finished) {
         ev.outputBuffer.getChannelData(0).fill(0);
         ev.outputBuffer.getChannelData(1).fill(0);
         if (eng?.finished) this.stop(true);
         return;
       }
+      // Render stereo interleaved floats, then de-interleave into Web Audio channels.
       eng.renderBlock(bufferSize, interleaved);
       const L = ev.outputBuffer.getChannelData(0);
       const R = ev.outputBuffer.getChannelData(1);
@@ -98,15 +137,20 @@ export class AudioPlayer {
     node.connect(gain);
     gain.connect(ctx.destination);
     this.playing = true;
-    this.tick();
+    this.tick(); // start UI refresh loop
   }
 
+  /** Animation-frame loop that pushes engine state to the UI via `onFrame`. */
   private tick = (): void => {
     if (!this.playing || !this.engine) return;
     this.onFrame?.(this.engine);
     this.raf = requestAnimationFrame(this.tick);
   };
 
+  /**
+   * Stop playback and disconnect the audio graph.
+   * @param emitEnded - if true (and we were playing), fire `onEnded`
+   */
   stop(emitEnded = false): void {
     const wasPlaying = this.playing;
     this.playing = false;
@@ -114,12 +158,12 @@ export class AudioPlayer {
     try {
       this.node?.disconnect();
     } catch {
-      /* ignore */
+      /* already disconnected */
     }
     try {
       this.gain?.disconnect();
     } catch {
-      /* ignore */
+      /* already disconnected */
     }
     this.node = null;
     this.gain = null;
@@ -128,7 +172,13 @@ export class AudioPlayer {
   }
 }
 
-/** Offline render a song to a downloadable WAV file. Yields so the UI can update. */
+/**
+ * Offline-render an entire song to a WAV Blob.
+ *
+ * Runs the engine in chunks on the main thread, yielding to the event loop
+ * every ~40 ms so the progress callback can update the UI without freezing.
+ * Trims trailing silence and encodes 16-bit stereo PCM.
+ */
 export async function exportSongWav(
   score: SmusScore,
   instruments: Map<number, Instrument>,
@@ -144,25 +194,28 @@ export async function exportSongWav(
   engine.kick();
 
   const block = 2048;
-  const maxSamples = sampleRate * 600;
+  const maxSamples = sampleRate * 600; // hard cap: 10 minutes
   const chunks: Float32Array[] = [];
   let total = 0;
   const buf = new Float32Array(block * 2);
   let lastYield = performance.now();
 
+  // Render until the sequencer and all voices are idle.
   while (total < maxSamples) {
     engine.renderBlock(block, buf);
     chunks.push(buf.slice());
     total += block;
     if (engine.finished && engine.voices.every((v) => !v.active)) break;
 
+    // Rough progress estimate (capped); real length unknown until finished.
     opts.onProgress?.(Math.min(0.95, total / (sampleRate * 120)));
     if (performance.now() - lastYield > 40) {
-      await new Promise((r) => setTimeout(r, 0));
+      await new Promise((r) => setTimeout(r, 0)); // yield to UI
       lastYield = performance.now();
     }
   }
 
+  // Concatenate chunk buffers into one interleaved stream.
   const audio = new Float32Array(total * 2);
   let off = 0;
   for (const c of chunks) {
@@ -170,6 +223,7 @@ export async function exportSongWav(
     off += c.length;
   }
 
+  // Find last audible sample and keep a short pad of silence after it.
   const thresh = 1e-4;
   let last = 0;
   for (let i = 0; i < total; i++) {
